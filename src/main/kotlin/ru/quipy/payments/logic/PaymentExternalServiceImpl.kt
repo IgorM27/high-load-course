@@ -32,6 +32,10 @@ class PaymentExternalSystemAdapterImpl(
         val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
         val emptyBody = RequestBody.create(null, ByteArray(0))
         val mapper = ObjectMapper().registerKotlinModule()
+
+        private val CONNECT_TIMEOUT = Duration.ofMillis(3000)
+        private val READ_TIMEOUT = Duration.ofMillis(3000)
+        private val CALL_TIMEOUT = Duration.ofMillis(3000)
     }
 
     private val serviceName = properties.serviceName
@@ -44,7 +48,11 @@ class PaymentExternalSystemAdapterImpl(
     }
     private val paymentExecutor = Executors.newFixedThreadPool(parallelRequests)
 
-    private val client = OkHttpClient.Builder().build()
+    private val client = OkHttpClient.Builder()
+        .connectTimeout(CONNECT_TIMEOUT)
+        .readTimeout(READ_TIMEOUT)
+        .callTimeout(CALL_TIMEOUT)
+        .build()
 
     fun getRateLimitPerSec(): Int {
         return this.rateLimitPerSec;
@@ -80,8 +88,8 @@ class PaymentExternalSystemAdapterImpl(
         var finalMessage: String? = null
 
         val maxAttempts = 3
-        val baseDelayMs = 700L
-        val maxDelayMs = 2_000L
+        val baseDelayMs = 300L  // Уменьшено для ускорения повторных попыток
+        val maxDelayMs = 800L   // Уменьшено для ускорения повторных попыток
 
         var attempt = 0
         while (true) {
@@ -96,17 +104,17 @@ class PaymentExternalSystemAdapterImpl(
                     val code = response.code
                     // Retry only on transient HTTP statuses
                     if (code == 429 || code == 500 || code == 502 || code == 503  || code == 504) {
-                    val retryAfter = response.header("Retry-After")?.toLongOrNull()?.times(1000)
-                    val delay = retryAfter ?: computeDelayMillis(attempt, baseDelayMs, maxDelayMs)
-                    if (!shouldRetry(attempt, maxAttempts, deadline, delay)) {
-                        finalSuccess = false
-                        finalMessage = "HTTP $code"
-                        break
+                        val retryAfter = response.header("Retry-After")?.toLongOrNull()?.times(1000)
+                        val delay = retryAfter ?: computeDelayMillis(attempt, baseDelayMs, maxDelayMs)
+                        if (!shouldRetry(attempt, maxAttempts, deadline, delay)) {
+                            finalSuccess = false
+                            finalMessage = "HTTP $code"
+                            break
+                        }
+                        logger.warn("[$accountName] HTTP $code for $paymentId (attempt $attempt), retrying in ${delay}ms")
+                        Thread.sleep(adjustDelayToDeadline(delay, deadline))
+                        continue
                     }
-                    logger.warn("[$accountName] HTTP $code for $paymentId (attempt $attempt), retrying in ${delay}ms")
-                    Thread.sleep(adjustDelayToDeadline(delay, deadline))
-                    continue
-                }
 
                     val body = try {
                         mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
