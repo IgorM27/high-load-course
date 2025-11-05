@@ -7,7 +7,7 @@ import okhttp3.Request
 import okhttp3.RequestBody
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
-//import ru.quipy.payments.logic.PaymentRateLimiterFactory
+import ru.quipy.payments.logic.PaymentRateLimiterFactory
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
@@ -24,7 +24,7 @@ class PaymentExternalSystemAdapterImpl(
     private val paymentProviderHostPort: String,
     private val token: String,
     private val rateLimiterFactory: PaymentRateLimiterFactory,
-    private val metricsReporter: MetricsReporter
+//    private val metricsReporter: MetricsReporter
 ) : PaymentExternalSystemAdapter {
 
     companion object {
@@ -52,7 +52,7 @@ class PaymentExternalSystemAdapterImpl(
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         paymentExecutor.submit {
             try {
-                metricsReporter.incrementOutgoing()
+//                metricsReporter.incrementOutgoing()
 //                rateLimiter.tickBlocking()
 
                 executePayment(paymentId, amount, paymentStartedAt, deadline)
