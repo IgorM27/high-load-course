@@ -6,8 +6,6 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
 import org.slf4j.LoggerFactory
-import org.springframework.beans.factory.annotation.Autowired
-import ru.quipy.payments.logic.PaymentRateLimiterFactory
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.io.IOException
@@ -15,7 +13,7 @@ import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
 import java.util.concurrent.Executors
-import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicInteger
 
 
 // Advice: always treat time as a Duration
@@ -32,6 +30,8 @@ class PaymentExternalSystemAdapterImpl(
         val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
         val emptyBody = RequestBody.create(null, ByteArray(0))
         val mapper = ObjectMapper().registerKotlinModule()
+
+        private val CONNECT_TIMEOUT = Duration.ofMillis(3000)
     }
 
     private val serviceName = properties.serviceName
@@ -44,7 +44,11 @@ class PaymentExternalSystemAdapterImpl(
     }
     private val paymentExecutor = Executors.newFixedThreadPool(parallelRequests)
 
-    private val client = OkHttpClient.Builder().build()
+    private val timeoutCalculator = QuantileBasedTimeoutCalculator()
+    private val requestCount = AtomicInteger(0)
+    private val timeoutUpdateThreshold = 33
+
+    @Volatile private var currentReadTimeout = Duration.ofMillis(5000)
 
     fun getRateLimitPerSec(): Int {
         return this.rateLimitPerSec;
@@ -66,6 +70,9 @@ class PaymentExternalSystemAdapterImpl(
     private fun executePayment(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
+        // Expose current timeout as gauge for observability
+        metricsReporter.updateCurrentTimeout(accountName, currentReadTimeout.toMillis())
+
         val transactionId = UUID.randomUUID()
 
         // Вне зависимости от исхода оплаты важно отметить что она была отправлена.
@@ -80,33 +87,51 @@ class PaymentExternalSystemAdapterImpl(
         var finalMessage: String? = null
 
         val maxAttempts = 3
-        val baseDelayMs = 700L
-        val maxDelayMs = 2_000L
+        val baseDelayMs = 300L
+        val maxDelayMs = 800L
 
         var attempt = 0
         while (true) {
             attempt += 1
+            val attemptStartTime = System.currentTimeMillis()
+
             try {
+                val timeUntilDeadline = deadline - now()
+                if (timeUntilDeadline <= 0) {
+                    finalSuccess = false
+                    finalMessage = "Deadline exceeded"
+                    break
+                }
+
+                val timeoutForThisRequest = minOf(currentReadTimeout.toMillis(), timeUntilDeadline)
+
                 val request = Request.Builder().run {
                     url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
                     post(emptyBody)
                 }.build()
 
-                client.newCall(request).execute().use { response ->
+                val requestClient = OkHttpClient.Builder()
+                    .connectTimeout(CONNECT_TIMEOUT)
+                    .readTimeout(Duration.ofMillis(timeoutForThisRequest))
+                    .callTimeout(Duration.ofMillis(timeoutForThisRequest + 1000))
+                    .build()
+
+                requestClient.newCall(request).execute().use { response ->
                     val code = response.code
                     // Retry only on transient HTTP statuses
                     if (code == 429 || code == 500 || code == 502 || code == 503  || code == 504) {
-                    val retryAfter = response.header("Retry-After")?.toLongOrNull()?.times(1000)
-                    val delay = retryAfter ?: computeDelayMillis(attempt, baseDelayMs, maxDelayMs)
-                    if (!shouldRetry(attempt, maxAttempts, deadline, delay)) {
-                        finalSuccess = false
-                        finalMessage = "HTTP $code"
-                        break
+                        val retryAfter = response.header("Retry-After")?.toLongOrNull()?.times(1000)
+                        val delay = retryAfter ?: computeDelayMillis(attempt, baseDelayMs, maxDelayMs)
+                        if (!shouldRetry(attempt, maxAttempts, deadline, delay)) {
+                            finalSuccess = false
+                            finalMessage = "HTTP $code"
+                            break
+                        }
+                        logger.warn("[$accountName] HTTP $code for $paymentId (attempt $attempt), retrying in ${delay}ms")
+                        metricsReporter.incrementRetry()
+                        Thread.sleep(adjustDelayToDeadline(delay, deadline))
+                        continue
                     }
-                    logger.warn("[$accountName] HTTP $code for $paymentId (attempt $attempt), retrying in ${delay}ms")
-                    Thread.sleep(adjustDelayToDeadline(delay, deadline))
-                    continue
-                }
 
                     val body = try {
                         mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
@@ -131,12 +156,21 @@ class PaymentExternalSystemAdapterImpl(
                         break
                     }
                     logger.warn("[$accountName] Transient error on attempt $attempt for payment $paymentId: ${e.message}. Retrying in ${delay}ms")
+                    metricsReporter.incrementRetry()
                     Thread.sleep(adjustDelayToDeadline(delay, deadline))
                     continue
                 } else {
                     logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
                     finalSuccess = false
                     finalMessage = e.message
+                }
+            } finally {
+                val latency = System.currentTimeMillis() - attemptStartTime
+                timeoutCalculator.addLatencyMeasurement(latency)
+
+                val count = requestCount.incrementAndGet()
+                if (count % timeoutUpdateThreshold == 0) {
+                    updateTimeouts()
                 }
             }
 
@@ -153,6 +187,14 @@ class PaymentExternalSystemAdapterImpl(
             metricsReporter.incrementCompleted()
         } else {
             metricsReporter.incrementFailed()
+        }
+    }
+
+    private fun updateTimeouts() {
+        val newTimeout = timeoutCalculator.calculateOptimalTimeout()
+        if (newTimeout != currentReadTimeout) {
+            currentReadTimeout = newTimeout
+            metricsReporter.updateCurrentTimeout(accountName, currentReadTimeout.toMillis())
         }
     }
 
