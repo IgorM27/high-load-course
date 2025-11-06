@@ -1,6 +1,7 @@
 package ru.quipy.payments.logic
 
 import io.micrometer.core.instrument.Counter
+import io.micrometer.core.instrument.Gauge
 import io.micrometer.core.instrument.MeterRegistry
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
@@ -8,6 +9,7 @@ import org.springframework.scheduling.annotation.Scheduled
 import org.springframework.stereotype.Component
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.ConcurrentHashMap
 
 @Component
 class MetricsReporter {
@@ -18,6 +20,7 @@ class MetricsReporter {
     private val outgoingRequests = AtomicLong(0)
     private val completedRequests = AtomicLong(0)
     private val failedRequests = AtomicLong(0)
+    private val retryRequests = AtomicLong(0)
 
     @Autowired
     private lateinit var meterRegistry: MeterRegistry
@@ -26,6 +29,9 @@ class MetricsReporter {
     private lateinit var outgoingCounter: Counter
     private lateinit var completedCounter: Counter
     private lateinit var failedCounter: Counter
+    private lateinit var retryCounter: Counter
+
+    private val timeoutGaugesByAccount = ConcurrentHashMap<String, AtomicLong>()
 
     @Autowired
     fun initMetrics() {
@@ -43,6 +49,10 @@ class MetricsReporter {
 
         failedCounter = Counter.builder("payment.requests.failed")
             .description("Total failed payment requests")
+            .register(meterRegistry)
+
+        retryCounter = Counter.builder("payment.requests.retries")
+            .description("Total retry attempts for payment requests")
             .register(meterRegistry)
     }
 
@@ -66,15 +76,33 @@ class MetricsReporter {
         failedCounter.increment()
     }
 
+    fun incrementRetry() {
+        retryRequests.incrementAndGet()
+        retryCounter.increment()
+    }
+
+    fun updateCurrentTimeout(account: String, timeoutMs: Long) {
+        val holder = timeoutGaugesByAccount.computeIfAbsent(account) { acc ->
+            val atomic = AtomicLong(timeoutMs)
+            Gauge.builder("payment.timeout.current_ms", atomic) { it.get().toDouble() }
+                .description("Current read timeout used for external payment requests")
+                .tag("account", acc)
+                .register(meterRegistry)
+            atomic
+        }
+        holder.set(timeoutMs)
+    }
+
     @Scheduled(fixedRate = 10, timeUnit = TimeUnit.SECONDS)
     fun reportMetrics() {
         val incoming = incomingRequests.get()
         val outgoing = outgoingRequests.get()
         val completed = completedRequests.get()
         val failed = failedRequests.get()
+        val retries = retryRequests.get()
 
         logger.info(
-            "METRICS | Incoming: $incoming | Outgoing: $outgoing | Completed: $completed | Failed: $failed"
+            "METRICS | Incoming: $incoming | Outgoing: $outgoing | Completed: $completed | Failed: $failed | Retries: $retries"
         )
     }
 }

@@ -46,7 +46,7 @@ class PaymentExternalSystemAdapterImpl(
 
     private val timeoutCalculator = QuantileBasedTimeoutCalculator()
     private val requestCount = AtomicInteger(0)
-    private val timeoutUpdateThreshold = 100
+    private val timeoutUpdateThreshold = 33
 
     @Volatile private var currentReadTimeout = Duration.ofMillis(5000)
 
@@ -69,6 +69,9 @@ class PaymentExternalSystemAdapterImpl(
 
     private fun executePayment(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
+
+        // Expose current timeout as gauge for observability
+        metricsReporter.updateCurrentTimeout(accountName, currentReadTimeout.toMillis())
 
         val transactionId = UUID.randomUUID()
 
@@ -125,6 +128,7 @@ class PaymentExternalSystemAdapterImpl(
                             break
                         }
                         logger.warn("[$accountName] HTTP $code for $paymentId (attempt $attempt), retrying in ${delay}ms")
+                        metricsReporter.incrementRetry()
                         Thread.sleep(adjustDelayToDeadline(delay, deadline))
                         continue
                     }
@@ -152,6 +156,7 @@ class PaymentExternalSystemAdapterImpl(
                         break
                     }
                     logger.warn("[$accountName] Transient error on attempt $attempt for payment $paymentId: ${e.message}. Retrying in ${delay}ms")
+                    metricsReporter.incrementRetry()
                     Thread.sleep(adjustDelayToDeadline(delay, deadline))
                     continue
                 } else {
@@ -189,6 +194,7 @@ class PaymentExternalSystemAdapterImpl(
         val newTimeout = timeoutCalculator.calculateOptimalTimeout()
         if (newTimeout != currentReadTimeout) {
             currentReadTimeout = newTimeout
+            metricsReporter.updateCurrentTimeout(accountName, currentReadTimeout.toMillis())
         }
     }
 
