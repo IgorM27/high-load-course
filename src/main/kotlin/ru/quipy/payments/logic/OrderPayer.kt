@@ -42,9 +42,9 @@ class OrderPayer {
     )
 
     var limiter = LeakingBucketRateLimiter(
-        rate = 11,
+        rate = 100,
         window = Duration.ofSeconds(1),
-        bucketSize = 270
+        bucketSize = 1950
     )
 
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long? {
