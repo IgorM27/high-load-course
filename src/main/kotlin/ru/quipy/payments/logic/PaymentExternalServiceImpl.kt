@@ -58,7 +58,6 @@ class PaymentExternalSystemAdapterImpl(
         paymentExecutor.submit {
             try {
                 metricsReporter.incrementOutgoing()
-                rateLimiter.tickBlocking()
 
                 executePayment(paymentId, amount, paymentStartedAt, deadline)
             } catch (e: Exception) {
@@ -92,6 +91,7 @@ class PaymentExternalSystemAdapterImpl(
 
         var attempt = 0
         while (true) {
+            rateLimiter.tickBlocking()
             attempt += 1
             val attemptStartTime = System.currentTimeMillis()
 
