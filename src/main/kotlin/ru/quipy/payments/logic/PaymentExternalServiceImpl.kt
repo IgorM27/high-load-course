@@ -36,7 +36,6 @@ class PaymentExternalSystemAdapterImpl(
         val mapper = ObjectMapper().registerKotlinModule()
 
         private val CONNECT_TIMEOUT = Duration.ofMillis(3000)
-        private const val MAX_CONNECTIONS = 25000
         private const val PENDING_ACQUIRE_TIMEOUT_SEC = 60L
     }
 
@@ -57,7 +56,7 @@ class PaymentExternalSystemAdapterImpl(
     private val currentReadTimeout: Duration = computeStaticTimeout()
 
     private val connectionProvider = ConnectionProvider.builder("payment-provider-$accountName")
-        .maxConnections(MAX_CONNECTIONS)
+        .maxConnections(parallelRequests)
         .pendingAcquireTimeout(Duration.ofSeconds(PENDING_ACQUIRE_TIMEOUT_SEC))
         .pendingAcquireMaxCount(-1)
         .maxIdleTime(Duration.ofSeconds(30))
