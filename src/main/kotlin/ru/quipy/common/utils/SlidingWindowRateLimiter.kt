@@ -7,11 +7,10 @@ import kotlinx.coroutines.launch
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import java.time.Duration
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.Executors
-import java.util.concurrent.PriorityBlockingQueue
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
-import java.util.concurrent.locks.ReentrantLock
-import kotlin.concurrent.withLock
 
 class SlidingWindowRateLimiter(
     private val rate: Long,
@@ -19,17 +18,18 @@ class SlidingWindowRateLimiter(
 ) : RateLimiter {
     private val rateLimiterScope = CoroutineScope(Executors.newSingleThreadExecutor().asCoroutineDispatcher())
 
-    private val sum = AtomicLong(0)
-    private val queue = PriorityBlockingQueue<Measure>(10_000)
+    private val currentCount = AtomicInteger(0)
+    private val timestamps = ConcurrentLinkedQueue<Long>()
 
     override fun tick(): Boolean {
-        while (true) {
-            val curSum = sum.get()
-            if (curSum >= rate) return false
-            if (sum.compareAndSet(curSum, curSum + 1)) {
-                queue.add(Measure(1, System.currentTimeMillis()))
-                return true
-            }
+        removeExpired()
+        val now = System.currentTimeMillis()
+        if (currentCount.incrementAndGet() <= rate) {
+            timestamps.add(now)
+            return true
+        } else {
+            currentCount.decrementAndGet()
+            return false
         }
     }
 
@@ -39,31 +39,38 @@ class SlidingWindowRateLimiter(
         }
     }
 
-    data class Measure(
-        val value: Long,
-        val timestamp: Long
-    ) : Comparable<Measure> {
-        override fun compareTo(other: Measure): Int {
-            return timestamp.compareTo(other.timestamp)
+    suspend fun acquireSuspend(timeoutMillis: Long): Boolean {
+        val deadline = System.currentTimeMillis() + timeoutMillis
+
+        while (System.currentTimeMillis() < deadline) {
+            removeExpired()
+            if (currentCount.get() < rate) {
+                val now = System.currentTimeMillis()
+                if (currentCount.incrementAndGet() <= rate) {
+                    timestamps.add(now)
+                    return true
+                } else {
+                    currentCount.decrementAndGet()
+                }
+            }
+            delay(10)
+        }
+        return false
+    }
+
+    private fun removeExpired() {
+        val expiration = System.currentTimeMillis() - window.toMillis()
+        while (true) {
+            val ts = timestamps.peek() ?: break
+            if (ts < expiration) {
+                timestamps.poll()
+                currentCount.decrementAndGet()
+            } else {
+                break
+            }
         }
     }
 
-    private val releaseJob = rateLimiterScope.launch {
-        while (true) {
-            val head = queue.peek()
-            val winStart = System.currentTimeMillis() - window.toMillis()
-            if (head == null) {
-                delay(1L)
-                continue
-            }
-            if (head.timestamp > winStart) {
-                delay(head.timestamp - winStart)
-                continue
-            }
-            sum.addAndGet(-1)
-            queue.take()
-        }
-    }.invokeOnCompletion { th -> if (th != null) logger.error("Rate limiter release job completed", th) }
     companion object {
         private val logger: Logger = LoggerFactory.getLogger(SlidingWindowRateLimiter::class.java)
     }
