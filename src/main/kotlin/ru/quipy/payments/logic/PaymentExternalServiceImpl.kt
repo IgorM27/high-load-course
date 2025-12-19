@@ -57,7 +57,7 @@ class PaymentExternalSystemAdapterImpl(
 
     private val connectionProvider = ConnectionProvider.builder("payment-service-$accountName")
         .maxConnections(parallelRequests)
-        .pendingAcquireMaxCount(parallelRequests)
+        .pendingAcquireMaxCount(-1)
         .maxIdleTime(Duration.ofSeconds(30))
         .build()
 
