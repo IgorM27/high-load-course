@@ -65,7 +65,6 @@ class PaymentExternalSystemAdapterImpl(
         val timeoutMs = (requestAverageProcessingTime.toMillis() * 1.5).toLong()
 
         val httpClient = HttpClient.create(connectionProvider)
-            .protocol(HttpProtocol.H2C)
             .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, CONNECT_TIMEOUT.toMillis().toInt())
             .responseTimeout(Duration.ofMillis(timeoutMs))
             .doOnConnected { conn ->
