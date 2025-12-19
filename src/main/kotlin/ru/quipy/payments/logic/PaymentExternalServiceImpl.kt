@@ -56,9 +56,8 @@ class PaymentExternalSystemAdapterImpl(
         SlidingWindowRateLimiter(rate = rateLimitPerSec.toLong(), window = Duration.ofSeconds(1))
     }
 
-    @OptIn(ExperimentalCoroutinesApi::class)
     private val esDispatcher = Dispatchers.IO.limitedParallelism(
-        parallelism = minOf(effectiveMaxConnections / 10, 500).coerceAtLeast(50)
+        parallelism = minOf(effectiveMaxConnections / 20, 300).coerceAtLeast(50)
     )
 
     private val paymentScope = CoroutineScope(
@@ -68,9 +67,9 @@ class PaymentExternalSystemAdapterImpl(
     private val connectionProvider = ConnectionProvider.builder("payment-service-$accountName")
         .maxConnections(effectiveMaxConnections)
         .pendingAcquireMaxCount(-1)
-        .maxIdleTime(Duration.ofSeconds(20))
-        .maxLifeTime(Duration.ofMinutes(5))
-        .evictInBackground(Duration.ofSeconds(30))
+        .maxIdleTime(Duration.ofSeconds(15))
+        .maxLifeTime(Duration.ofMinutes(3))
+        .evictInBackground(Duration.ofSeconds(20))
         .build()
 
     private val webClient: WebClient by lazy {
@@ -81,6 +80,7 @@ class PaymentExternalSystemAdapterImpl(
             .responseTimeout(Duration.ofMillis(timeoutMs))
             .protocol(HttpProtocol.H2C, HttpProtocol.HTTP11)
             .keepAlive(true)  // Переиспользование соединений
+            .compress(true)
             .doOnConnected { conn ->
                 conn.addHandlerLast(ReadTimeoutHandler(timeoutMs, TimeUnit.MILLISECONDS))
                 conn.addHandlerLast(WriteTimeoutHandler(CONNECT_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS))
@@ -98,13 +98,15 @@ class PaymentExternalSystemAdapterImpl(
     }
 
     private suspend fun executePaymentSuspend(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
-        logger.warn("[$accountName] Submitting payment request for payment $paymentId")
-
         val transactionId = UUID.randomUUID()
 
-        withContext(esDispatcher) {
-            paymentESService.update(paymentId) {
-                it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
+        paymentScope.launch(esDispatcher) {
+            try {
+                paymentESService.update(paymentId) {
+                    it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
+                }
+            } catch (e: Exception) {
+                logger.error("[$accountName] Failed to log submission for payment $paymentId", e)
             }
         }
 
@@ -168,9 +170,13 @@ class PaymentExternalSystemAdapterImpl(
             }
         }
 
-        withContext(esDispatcher) {
-            paymentESService.update(paymentId) {
-                it.logProcessing(success, now(), transactionId, reason = message)
+        paymentScope.launch(esDispatcher) {
+            try {
+                paymentESService.update(paymentId) {
+                    it.logProcessing(success, now(), transactionId, reason = message)
+                }
+            } catch (e: Exception) {
+                logger.error("[$accountName] Failed to log processing for payment $paymentId", e)
             }
         }
     }
