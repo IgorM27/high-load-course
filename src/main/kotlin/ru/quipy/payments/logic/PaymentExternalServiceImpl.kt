@@ -22,6 +22,7 @@ import java.io.IOException
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
 
@@ -39,6 +40,8 @@ class PaymentExternalSystemAdapterImpl(
 
         val CONNECT_TIMEOUT: Duration = Duration.ofSeconds(1)
         const val MAX_RETRY_ATTEMPTS = 3
+
+        private val esDispatcher = Executors.newFixedThreadPool(256).asCoroutineDispatcher()
     }
 
     private val serviceName = properties.serviceName
@@ -67,6 +70,7 @@ class PaymentExternalSystemAdapterImpl(
         val httpClient = HttpClient.create(connectionProvider)
             .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, CONNECT_TIMEOUT.toMillis().toInt())
             .responseTimeout(Duration.ofMillis(timeoutMs))
+            .protocol(HttpProtocol.H2C)
             .doOnConnected { conn ->
                 conn.addHandlerLast(ReadTimeoutHandler(timeoutMs, TimeUnit.MILLISECONDS))
                 conn.addHandlerLast(WriteTimeoutHandler(CONNECT_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS))
@@ -88,7 +92,7 @@ class PaymentExternalSystemAdapterImpl(
 
         val transactionId = UUID.randomUUID()
 
-        withContext(Dispatchers.IO) {
+        withContext(esDispatcher) {
             paymentESService.update(paymentId) {
                 it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
             }
@@ -154,7 +158,7 @@ class PaymentExternalSystemAdapterImpl(
             }
         }
 
-        withContext(Dispatchers.IO) {
+        withContext(esDispatcher) {
             paymentESService.update(paymentId) {
                 it.logProcessing(success, now(), transactionId, reason = message)
             }
