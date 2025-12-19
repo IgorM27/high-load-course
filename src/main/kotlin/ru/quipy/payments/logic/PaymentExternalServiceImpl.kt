@@ -6,7 +6,6 @@ import io.netty.channel.ChannelOption
 import io.netty.handler.timeout.ReadTimeoutHandler
 import io.netty.handler.timeout.WriteTimeoutHandler
 import kotlinx.coroutines.*
-import kotlinx.coroutines.sync.Semaphore
 import org.slf4j.LoggerFactory
 import org.springframework.http.client.reactive.ReactorClientHttpConnector
 import org.springframework.web.reactive.function.client.WebClient
@@ -48,8 +47,6 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
-    private val concurrencySemaphore = Semaphore(parallelRequests)
-
     private val rateLimiter: SlidingWindowRateLimiter by lazy {
         SlidingWindowRateLimiter(rate = rateLimitPerSec.toLong(), window = Duration.ofSeconds(1))
     }
@@ -83,39 +80,7 @@ class PaymentExternalSystemAdapterImpl(
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         paymentScope.launch {
-            val timeUntilDeadline = deadline - now()
-            if (timeUntilDeadline <= 0) {
-                logFailure(paymentId, "Deadline exceeded before processing")
-                return@launch
-            }
-
-            val acquired = tryAcquireWithTimeout(timeUntilDeadline)
-            if (!acquired) {
-                logFailure(paymentId, "Deadline exceeded waiting for available slot")
-                return@launch
-            }
-
-            try {
-                executePaymentSuspend(paymentId, amount, paymentStartedAt, deadline)
-            } finally {
-                concurrencySemaphore.release()
-            }
-        }
-    }
-
-    private suspend fun tryAcquireWithTimeout(timeoutMillis: Long): Boolean {
-        return withTimeoutOrNull(timeoutMillis) {
-            concurrencySemaphore.acquire()
-            true
-        } ?: false
-    }
-
-    private suspend fun logFailure(paymentId: UUID, reason: String) {
-        logger.warn("[$accountName] Payment failed for $paymentId: $reason")
-        withContext(Dispatchers.IO) {
-            paymentESService.update(paymentId) {
-                it.logProcessing(false, now(), null, reason = reason)
-            }
+            executePaymentSuspend(paymentId, amount, paymentStartedAt, deadline)
         }
     }
 
@@ -149,7 +114,7 @@ class PaymentExternalSystemAdapterImpl(
                 }
 
                 if (!rateLimiter.acquireSuspend(timeUntilDeadline)) {
-                    message = "Deadline exceeded waiting for rate limiter"
+                    message = "Deadline exceeded"
                     break
                 }
 
