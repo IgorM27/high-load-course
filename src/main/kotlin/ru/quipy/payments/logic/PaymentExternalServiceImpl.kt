@@ -31,31 +31,29 @@ class PaymentExternalSystemAdapterImpl(
     private val token: String,
 ) : PaymentExternalSystemAdapter {
 
-    companion object {
-        val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
-        val mapper = ObjectMapper().registerKotlinModule()
-
-        val connectionProvider: ConnectionProvider = ConnectionProvider.builder("payment-provider")
-            .maxConnections(100_000)
-            .pendingAcquireMaxCount(100_000)
-            .pendingAcquireTimeout(Duration.ofSeconds(120))
-            .maxIdleTime(Duration.ofSeconds(60))
-            .build()
-
-        val sharedHttpClient: HttpClient = HttpClient.create(connectionProvider)
-            .protocol(HttpProtocol.H2C)
-            .responseTimeout(Duration.ofMillis(120000))
-            .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 10000)
-
-        private val sharedDispatcher = Executors.newFixedThreadPool(64).asCoroutineDispatcher()
-
-        val paymentScope = CoroutineScope(SupervisorJob() + sharedDispatcher)
-    }
-
     private val serviceName = properties.serviceName
     private val accountName = properties.accountName
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
+
+    val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
+    val mapper = ObjectMapper().registerKotlinModule()
+
+    val connectionProvider: ConnectionProvider = ConnectionProvider.builder("payment-provider")
+        .maxConnections(parallelRequests)
+        .pendingAcquireMaxCount(parallelRequests)
+        .pendingAcquireTimeout(Duration.ofSeconds(120))
+        .maxIdleTime(Duration.ofSeconds(60))
+        .build()
+
+    val sharedHttpClient: HttpClient = HttpClient.create(connectionProvider)
+        .protocol(HttpProtocol.H2C)
+        .responseTimeout(Duration.ofMillis(120_000))
+        .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 10_000)
+
+    private val sharedDispatcher = Executors.newFixedThreadPool(64).asCoroutineDispatcher()
+
+        val paymentScope = CoroutineScope(SupervisorJob() + sharedDispatcher)
 
     private val rateLimiter = SlidingWindowRateLimiter(
         rateLimitPerSec.toLong(),
