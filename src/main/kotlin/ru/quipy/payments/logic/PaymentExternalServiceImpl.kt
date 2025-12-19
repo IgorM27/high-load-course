@@ -39,10 +39,6 @@ class PaymentExternalSystemAdapterImpl(
 
         val CONNECT_TIMEOUT: Duration = Duration.ofSeconds(1)
         const val MAX_RETRY_ATTEMPTS = 3
-
-        // Размеры пулов потоков
-        private const val IO_THREAD_COUNT = 200
-        private const val DB_THREAD_COUNT = 100
     }
 
     private val serviceName = properties.serviceName
@@ -51,26 +47,26 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
+    private val effectiveMaxConnections = parallelRequests
+
     private val rateLimiter: SlidingWindowRateLimiter by lazy {
-        SlidingWindowRateLimiter(rate = rateLimitPerSec.toLong(), window = Duration.ofSeconds(1))
+        SlidingWindowRateLimiter(rate = (rateLimitPerSec * 0.95).toLong(), window = Duration.ofSeconds(1))
     }
 
-    // Отдельный пул для IO операций (HTTP запросы)
-    @OptIn(DelicateCoroutinesApi::class)
-    private val ioScope = CoroutineScope(
-        newFixedThreadPoolContext(IO_THREAD_COUNT, "io-pool-$accountName") + SupervisorJob()
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private val esDispatcher = Dispatchers.IO.limitedParallelism(
+        parallelism = minOf(effectiveMaxConnections / 10, 500).coerceAtLeast(100)
     )
 
-    // Отдельный пул для DB операций (ES update)
-    @OptIn(DelicateCoroutinesApi::class)
-    private val dbScope = CoroutineScope(
-        newFixedThreadPoolContext(DB_THREAD_COUNT, "db-pool-$accountName") + SupervisorJob()
+    private val paymentScope = CoroutineScope(
+        Dispatchers.IO + SupervisorJob() + CoroutineName("payment-service-$accountName")
     )
 
     private val connectionProvider = ConnectionProvider.builder("payment-service-$accountName")
-        .maxConnections(10_000)
-        .pendingAcquireMaxCount(-1)
-        .maxIdleTime(Duration.ofSeconds(20))
+        .maxConnections(effectiveMaxConnections)
+        .pendingAcquireMaxCount(-1)  // безлимитная очередь
+        .pendingAcquireTimeout(Duration.ofSeconds(60))
+        .maxIdleTime(Duration.ofSeconds(30))
         .maxLifeTime(Duration.ofMinutes(5))
         .evictInBackground(Duration.ofSeconds(30))
         .build()
@@ -81,8 +77,9 @@ class PaymentExternalSystemAdapterImpl(
         val httpClient = HttpClient.create(connectionProvider)
             .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, CONNECT_TIMEOUT.toMillis().toInt())
             .responseTimeout(Duration.ofMillis(timeoutMs))
-            // HTTP/1.1 первый — будет использоваться по умолчанию, HTTP/2 как fallback
-            .protocol(HttpProtocol.HTTP11, HttpProtocol.H2C)
+            .protocol(HttpProtocol.H2C, HttpProtocol.HTTP11)
+            .keepAlive(true)
+            .compress(true)
             .doOnConnected { conn ->
                 conn.addHandlerLast(ReadTimeoutHandler(timeoutMs, TimeUnit.MILLISECONDS))
                 conn.addHandlerLast(WriteTimeoutHandler(CONNECT_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS))
@@ -94,16 +91,29 @@ class PaymentExternalSystemAdapterImpl(
     }
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
-        ioScope.launch {
+        paymentScope.launch {
             executePaymentSuspend(paymentId, amount, paymentStartedAt, deadline)
         }
     }
 
     private suspend fun executePaymentSuspend(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
+
+        val timeUntilDeadline = deadline - now()
+        if (timeUntilDeadline <= 0) {
+            logger.warn("[$accountName] Payment $paymentId rejected - deadline already exceeded")
+            logProcessingAsync(paymentId, false, UUID.randomUUID(), "Deadline exceeded before processing")
+            return
+        }
+
+        if (!rateLimiter.acquireSuspend(timeUntilDeadline)) {
+            logger.warn("[$accountName] Payment $paymentId rejected - rate limit exceeded")
+            logProcessingAsync(paymentId, false, UUID.randomUUID(), "Rate limit exceeded")
+            return
+        }
+
         val transactionId = UUID.randomUUID()
 
-        // Fire-and-forget: не ждём завершения, запускаем в отдельном DB пуле
-        dbScope.launch {
+        paymentScope.launch(esDispatcher) {
             try {
                 paymentESService.update(paymentId) {
                     it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
@@ -113,7 +123,7 @@ class PaymentExternalSystemAdapterImpl(
             }
         }
 
-        logger.info("[$accountName] Submit: $paymentId, txId: $transactionId")
+        logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
         var attempt = 0
         var message: String? = null
@@ -122,16 +132,10 @@ class PaymentExternalSystemAdapterImpl(
         while (!success && attempt++ < MAX_RETRY_ATTEMPTS) {
             try {
                 if (attempt > 1) {
-                    delay(50)
+                    delay(200L * attempt)
                 }
 
-                val timeUntilDeadline = deadline - now()
-                if (timeUntilDeadline <= 0) {
-                    message = "Deadline exceeded"
-                    break
-                }
-
-                if (!rateLimiter.acquireSuspend(timeUntilDeadline)) {
+                if (deadline - now() <= 0) {
                     message = "Deadline exceeded"
                     break
                 }
@@ -152,6 +156,13 @@ class PaymentExternalSystemAdapterImpl(
 
                             message = body.message
                             success = body.result
+                        } else if (statusCode.value() == 429) {
+                            logger.warn("[$accountName] Rate limit breached (429) for txId: $transactionId, payment: $paymentId")
+                            message = "Rate limit breached"
+                            success = false
+                        } else {
+                            logger.warn("[$accountName] Unexpected status ${statusCode.value()} for txId: $transactionId, payment: $paymentId")
+                            message = "Unexpected status: ${statusCode.value()}"
                         }
                     }
             } catch (e: Exception) {
@@ -162,6 +173,7 @@ class PaymentExternalSystemAdapterImpl(
                     }
                     isRetryableException(e) -> {
                         logger.warn("[$accountName] Retryable error for txId: $transactionId, payment: $paymentId, attempt: $attempt", e)
+                        message = e.message
                         continue
                     }
                     else -> {
@@ -173,8 +185,11 @@ class PaymentExternalSystemAdapterImpl(
             }
         }
 
-        // Fire-and-forget: логируем результат асинхронно
-        dbScope.launch {
+        logProcessingAsync(paymentId, success, transactionId, message)
+    }
+
+    private fun logProcessingAsync(paymentId: UUID, success: Boolean, transactionId: UUID, message: String?) {
+        paymentScope.launch(esDispatcher) {
             try {
                 paymentESService.update(paymentId) {
                     it.logProcessing(success, now(), transactionId, reason = message)
