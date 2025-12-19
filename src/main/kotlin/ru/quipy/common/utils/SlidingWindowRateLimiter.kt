@@ -39,26 +39,27 @@ class SlidingWindowRateLimiter(
         }
     }
 
+    suspend fun tickSuspending() {
+        while (!tick()) {
+            delay(10)
+        }
+    }
+
     suspend fun acquireSuspend(timeoutMillis: Long): Boolean {
         val deadline = System.currentTimeMillis() + timeoutMillis
 
         while (System.currentTimeMillis() < deadline) {
             removeExpired()
-
-            val currentRequests = currentCount.get()
-            if (currentRequests >= rate) {
-                delay(5)
-                continue
+            if (currentCount.get() < rate) {
+                val now = System.currentTimeMillis()
+                if (currentCount.incrementAndGet() <= rate) {
+                    timestamps.add(now)
+                    return true
+                } else {
+                    currentCount.decrementAndGet()
+                }
             }
-
-            val newCount = currentCount.incrementAndGet()
-            if (newCount <= rate) {
-                timestamps.add(System.currentTimeMillis())
-                return true
-            } else {
-                currentCount.decrementAndGet()
-                delay(5)
-            }
+            delay(10)
         }
         return false
     }

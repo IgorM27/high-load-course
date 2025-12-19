@@ -2,27 +2,26 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
-import io.netty.channel.ChannelOption
-import io.netty.handler.timeout.ReadTimeoutHandler
-import io.netty.handler.timeout.WriteTimeoutHandler
 import kotlinx.coroutines.*
+import kotlinx.coroutines.reactor.awaitSingle
+import kotlinx.coroutines.sync.Semaphore
 import org.slf4j.LoggerFactory
+import io.netty.channel.ChannelOption
 import org.springframework.http.client.reactive.ReactorClientHttpConnector
 import org.springframework.web.reactive.function.client.WebClient
-import org.springframework.web.reactive.function.client.WebClientResponseException
-import org.springframework.web.reactive.function.client.awaitBody
-import org.springframework.web.reactive.function.client.awaitExchange
+import org.springframework.web.reactive.function.client.WebClientResponseException.TooManyRequests
+import org.springframework.web.reactive.function.client.bodyToMono
 import reactor.netty.http.HttpProtocol
 import reactor.netty.http.client.HttpClient
 import reactor.netty.resources.ConnectionProvider
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
-import java.io.IOException
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
-import java.util.concurrent.TimeUnit
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeoutException
 
 
 class PaymentExternalSystemAdapterImpl(
@@ -34,84 +33,50 @@ class PaymentExternalSystemAdapterImpl(
 
     companion object {
         val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
-
         val mapper = ObjectMapper().registerKotlinModule()
 
-        val CONNECT_TIMEOUT: Duration = Duration.ofSeconds(1)
-        const val MAX_RETRY_ATTEMPTS = 3
+        val connectionProvider: ConnectionProvider = ConnectionProvider.builder("payment-provider")
+            .maxConnections(100_000)
+            .pendingAcquireMaxCount(100_000)
+            .pendingAcquireTimeout(Duration.ofSeconds(120))
+            .maxIdleTime(Duration.ofSeconds(60))
+            .build()
+
+        val sharedHttpClient: HttpClient = HttpClient.create(connectionProvider)
+            .protocol(HttpProtocol.H2C)
+            .responseTimeout(Duration.ofMillis(120000))
+            .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 10000)
+
+        private val sharedDispatcher = Executors.newFixedThreadPool(64).asCoroutineDispatcher()
+
+        val paymentScope = CoroutineScope(SupervisorJob() + sharedDispatcher)
     }
 
     private val serviceName = properties.serviceName
     private val accountName = properties.accountName
-    private val requestAverageProcessingTime = properties.averageProcessingTime
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
-    private val effectiveMaxConnections = parallelRequests
+    private val rateLimiter = SlidingWindowRateLimiter(
+        rateLimitPerSec.toLong(),
+        Duration.ofSeconds(1)
+    )
 
-    private val rateLimiter: SlidingWindowRateLimiter by lazy {
-        SlidingWindowRateLimiter(rate = (rateLimitPerSec * 0.98).toLong(), window = Duration.ofSeconds(1))
+    private val semaphore = Semaphore(parallelRequests)
+
+    init {
+        logger.warn("[$accountName] Initialized with rateLimitPerSec=$rateLimitPerSec, parallelRequests=$parallelRequests")
     }
 
-    private val esDispatcher = Dispatchers.IO.limitedParallelism(
-        parallelism = minOf(effectiveMaxConnections / 10, 500).coerceAtLeast(100)
-    )
-
-    private val paymentScope = CoroutineScope(
-        Dispatchers.IO + SupervisorJob() + CoroutineName("payment-service-$accountName")
-    )
-
-    private val connectionProvider = ConnectionProvider.builder("payment-service-$accountName")
-        .maxConnections(effectiveMaxConnections)
-        .pendingAcquireMaxCount(-1)
-        .pendingAcquireTimeout(Duration.ofSeconds(60))
-        .maxIdleTime(Duration.ofSeconds(30))
-        .maxLifeTime(Duration.ofMinutes(5))
-        .evictInBackground(Duration.ofSeconds(30))
+    private val webClient: WebClient = WebClient.builder()
+        .baseUrl("http://$paymentProviderHostPort")
+        .clientConnector(ReactorClientHttpConnector(sharedHttpClient))
         .build()
 
-    private val webClient: WebClient by lazy {
-        val timeoutMs = (requestAverageProcessingTime.toMillis() * 1.5).toLong()
-
-        val httpClient = HttpClient.create(connectionProvider)
-            .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, CONNECT_TIMEOUT.toMillis().toInt())
-            .responseTimeout(Duration.ofMillis(timeoutMs))
-            .protocol(HttpProtocol.H2C, HttpProtocol.HTTP11)
-            .keepAlive(true)
-            .compress(true)
-            .doOnConnected { conn ->
-                conn.addHandlerLast(ReadTimeoutHandler(timeoutMs, TimeUnit.MILLISECONDS))
-                conn.addHandlerLast(WriteTimeoutHandler(CONNECT_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS))
-            }
-
-        WebClient.builder()
-            .clientConnector(ReactorClientHttpConnector(httpClient))
-            .build()
-    }
-
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
-        paymentScope.launch {
-            executePaymentSuspend(paymentId, amount, paymentStartedAt, deadline)
-        }
-    }
-    private suspend fun executePaymentSuspend(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
-
-        val timeUntilDeadline = deadline - now()
-        if (timeUntilDeadline <= 0) {
-            logger.warn("[$accountName] Payment $paymentId rejected - deadline already exceeded")
-            logProcessingAsync(paymentId, false, UUID.randomUUID(), "Deadline exceeded before processing")
-            return
-        }
-
-        if (!rateLimiter.acquireSuspend(timeUntilDeadline)) {
-            logger.warn("[$accountName] Payment $paymentId rejected - rate limit exceeded")
-            logProcessingAsync(paymentId, false, UUID.randomUUID(), "Rate limit exceeded")
-            return
-        }
-
         val transactionId = UUID.randomUUID()
 
-        paymentScope.launch(esDispatcher) {
+        paymentScope.launch {
             try {
                 paymentESService.update(paymentId) {
                     it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
@@ -119,90 +84,63 @@ class PaymentExternalSystemAdapterImpl(
             } catch (e: Exception) {
                 logger.error("[$accountName] Failed to log submission for payment $paymentId", e)
             }
+
+            executePaymentReactive(paymentId, amount, transactionId)
         }
-
-        logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
-
-        var attempt = 0
-        var message: String? = null
-        var success = false
-
-        while (!success && attempt++ < MAX_RETRY_ATTEMPTS) {
-            try {
-                if (attempt > 1) {
-                    delay(200L * attempt)
-                }
-
-                if (deadline - now() <= 0) {
-                    message = "Deadline exceeded"
-                    break
-                }
-
-                val response = webClient.post()
-                    .uri("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
-                    .awaitExchange { response ->
-                        val statusCode = response.statusCode()
-                        if (statusCode.is2xxSuccessful) {
-                            val body = try {
-                                mapper.readValue(response.awaitBody<String>(), ExternalSysResponse::class.java)
-                            } catch (e: Exception) {
-                                logger.error("[$accountName] [ERROR] Failed to parse response for txId: $transactionId, payment: $paymentId", e)
-                                ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
-                            }
-
-                            logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
-                            message = body.message
-                            success = body.result
-                        } else if (statusCode.value() == 429) {
-                            logger.warn("[$accountName] Rate limit breached (429) for txId: $transactionId, payment: $paymentId")
-                            message = "Rate limit breached"
-                            success = false
-                        } else {
-                            logger.warn("[$accountName] Unexpected status ${statusCode.value()} for txId: $transactionId, payment: $paymentId")
-                            message = "Unexpected status: ${statusCode.value()}"
-                        }
-                        statusCode
-                    }
-
-                if (response.value() == 429) {
-                    break
-                }
-            } catch (e: Exception) {
-                when {
-                    e is WebClientResponseException && e.statusCode.value() == 429 -> {
-                        logger.warn("[$accountName] Rate limit breached (429 exception) for txId: $transactionId, payment: $paymentId")
-                        message = "Rate limit breached"
-                        break
-                    }
-                    e is SocketTimeoutException -> {
-                        logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", e)
-                        message = "Request timeout."
-                    }
-                    isRetryableException(e) -> {
-                        logger.warn("[$accountName] Retryable error for txId: $transactionId, payment: $paymentId, attempt: $attempt", e)
-                        message = e.message
-                        continue
-                    }
-                    else -> {
-                        logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
-                        message = e.message
-                        break
-                    }
-                }
-            }
-        }
-
-        logProcessingAsync(paymentId, success, transactionId, message)
     }
 
-    private fun logProcessingAsync(paymentId: UUID, success: Boolean, transactionId: UUID, message: String?) {
-        paymentScope.launch(esDispatcher) {
+    private suspend fun executePaymentReactive(paymentId: UUID, amount: Int, transactionId: UUID) {
+        rateLimiter.tickSuspending()
+        semaphore.acquire()
+
+        try {
+            val responseBody = webClient.post()
+                .uri { uriBuilder ->
+                    uriBuilder.path("/external/process")
+                        .queryParam("serviceName", serviceName)
+                        .queryParam("token", token)
+                        .queryParam("accountName", accountName)
+                        .queryParam("transactionId", transactionId)
+                        .queryParam("paymentId", paymentId)
+                        .queryParam("amount", amount)
+                        .build()
+                }
+                .retrieve()
+                .bodyToMono<String>()
+                .doFinally {
+                    semaphore.release()
+                }
+                .awaitSingle()
+
+            val body = try {
+                mapper.readValue(responseBody, ExternalSysResponse::class.java)
+            } catch (e: Exception) {
+                logger.error("[$accountName] Failed to parse response for payment $paymentId: $responseBody")
+                ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
+            }
+
+            logger.info("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
+
             try {
                 paymentESService.update(paymentId) {
-                    it.logProcessing(success, now(), transactionId, reason = message)
+                    it.logProcessing(body.result, now(), transactionId, reason = body.message)
                 }
             } catch (e: Exception) {
-                logger.error("[$accountName] Failed to log processing for payment $paymentId", e)
+                logger.error("[$accountName] Failed to log processing result for payment $paymentId", e)
+            }
+
+        } catch (e: TooManyRequests) {
+            logger.warn("[$accountName] Payment got 429 for txId: $transactionId, payment: $paymentId, retrying")
+            executePaymentReactive(paymentId, amount, transactionId)
+        } catch (e: Exception) {
+            logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
+
+            try {
+                paymentESService.update(paymentId) {
+                    it.logProcessing(false, now(), transactionId, reason = e.message)
+                }
+            } catch (ex: Exception) {
+                logger.error("[$accountName] Failed to log failure for payment $paymentId", ex)
             }
         }
     }
@@ -212,15 +150,6 @@ class PaymentExternalSystemAdapterImpl(
     override fun isEnabled() = properties.enabled
 
     override fun name() = properties.accountName
-}
-
-private fun isRetryableException(e: Exception): Boolean {
-    if (e is WebClientResponseException) {
-        return e.statusCode.is5xxServerError
-    }
-    return e is SocketTimeoutException ||
-            e is IOException ||
-            e.cause?.let { isRetryableException(it as? Exception ?: return@let false) } ?: false
 }
 
 public fun now() = System.currentTimeMillis()
