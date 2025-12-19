@@ -22,7 +22,6 @@ import java.io.IOException
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
-import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
 
@@ -40,8 +39,6 @@ class PaymentExternalSystemAdapterImpl(
 
         val CONNECT_TIMEOUT: Duration = Duration.ofSeconds(1)
         const val MAX_RETRY_ATTEMPTS = 3
-
-        private val esDispatcher = Executors.newFixedThreadPool(256).asCoroutineDispatcher()
     }
 
     private val serviceName = properties.serviceName
@@ -50,18 +47,30 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
+    private val effectiveMaxConnections = minOf(
+        parallelRequests,
+        (rateLimitPerSec * requestAverageProcessingTime.toSeconds() * 1.2).toInt()
+    ).coerceAtLeast(100)
+
     private val rateLimiter: SlidingWindowRateLimiter by lazy {
         SlidingWindowRateLimiter(rate = rateLimitPerSec.toLong(), window = Duration.ofSeconds(1))
     }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private val esDispatcher = Dispatchers.IO.limitedParallelism(
+        parallelism = minOf(effectiveMaxConnections / 10, 500).coerceAtLeast(50)
+    )
 
     private val paymentScope = CoroutineScope(
         Dispatchers.IO + SupervisorJob() + CoroutineName("payment-service-$accountName")
     )
 
     private val connectionProvider = ConnectionProvider.builder("payment-service-$accountName")
-        .maxConnections(parallelRequests)
+        .maxConnections(effectiveMaxConnections)
         .pendingAcquireMaxCount(-1)
-        .maxIdleTime(Duration.ofSeconds(30))
+        .maxIdleTime(Duration.ofSeconds(20))
+        .maxLifeTime(Duration.ofMinutes(5))
+        .evictInBackground(Duration.ofSeconds(30))
         .build()
 
     private val webClient: WebClient by lazy {
@@ -70,7 +79,8 @@ class PaymentExternalSystemAdapterImpl(
         val httpClient = HttpClient.create(connectionProvider)
             .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, CONNECT_TIMEOUT.toMillis().toInt())
             .responseTimeout(Duration.ofMillis(timeoutMs))
-            .protocol(HttpProtocol.H2C)
+            .protocol(HttpProtocol.H2C, HttpProtocol.HTTP11)
+            .keepAlive(true)  // Переиспользование соединений
             .doOnConnected { conn ->
                 conn.addHandlerLast(ReadTimeoutHandler(timeoutMs, TimeUnit.MILLISECONDS))
                 conn.addHandlerLast(WriteTimeoutHandler(CONNECT_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS))
