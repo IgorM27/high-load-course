@@ -44,16 +44,21 @@ class SlidingWindowRateLimiter(
 
         while (System.currentTimeMillis() < deadline) {
             removeExpired()
-            if (currentCount.get() < rate) {
-                val now = System.currentTimeMillis()
-                if (currentCount.incrementAndGet() <= rate) {
-                    timestamps.add(now)
-                    return true
-                } else {
-                    currentCount.decrementAndGet()
-                }
+
+            val currentRequests = currentCount.get()
+            if (currentRequests >= rate) {
+                delay(5)
+                continue
             }
-            delay(10)
+
+            val newCount = currentCount.incrementAndGet()
+            if (newCount <= rate) {
+                timestamps.add(System.currentTimeMillis())
+                return true
+            } else {
+                currentCount.decrementAndGet()
+                delay(5)
+            }
         }
         return false
     }
