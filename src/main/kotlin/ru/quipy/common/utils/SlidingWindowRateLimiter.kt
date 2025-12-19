@@ -53,7 +53,7 @@ class SlidingWindowRateLimiter(
                     currentCount.decrementAndGet()
                 }
             }
-            delay(10)
+            delay(1)
         }
         return false
     }
