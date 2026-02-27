@@ -41,9 +41,7 @@ class PaymentExternalSystemAdapterImpl(
         engine {
             protocolVersion = java.net.http.HttpClient.Version.HTTP_2
         }
-
         expectSuccess = false
-
         install(io.ktor.client.plugins.HttpTimeout) {
             requestTimeoutMillis = REQUEST_TIMEOUT
         }
@@ -57,8 +55,8 @@ class PaymentExternalSystemAdapterImpl(
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
         val transactionId = UUID.randomUUID()
-
         val startedAt = now()
+
         dbScope.launch {
             while (true) {
                 try {
@@ -71,7 +69,7 @@ class PaymentExternalSystemAdapterImpl(
                         )
                     }
                     break
-                } catch (_: java.lang.IllegalArgumentException) {
+                } catch (_: IllegalArgumentException) {
                     delay(10)
                 }
             }
@@ -80,8 +78,8 @@ class PaymentExternalSystemAdapterImpl(
         logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
         val result = send(paymentId, amount, transactionId, paymentStartedAt)
-
         val processedAt = now()
+
         dbScope.launch {
             while (true) {
                 try {
@@ -89,22 +87,21 @@ class PaymentExternalSystemAdapterImpl(
                         it.logProcessing(result.status, processedAt, transactionId, reason = result.message)
                     }
                     break
-                } catch (_: java.lang.IllegalArgumentException) {
+                } catch (_: IllegalArgumentException) {
                     delay(10)
                 }
             }
         }
     }
 
-    suspend fun send(paymentId: UUID, amount: Int, transactionId: UUID, paymentStartedAt: Long): Result {
+    private suspend fun send(paymentId: UUID, amount: Int, transactionId: UUID, paymentStartedAt: Long): Result {
         try {
             semaphore.acquire()
             if (!rateLimiter.acquireSuspend(200L)) {
                 return Result(false, "Rate limit exceeded")
             }
 
-            val response =
-                client.post("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
+            val response = client.post("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
 
             val body = try {
                 mapper.readValue(response.bodyAsText(), ExternalSysResponse::class.java)
@@ -120,7 +117,6 @@ class PaymentExternalSystemAdapterImpl(
                 is SocketTimeoutException -> {
                     logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId.", e)
                 }
-
                 else -> {
                     logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId.", e)
                 }
@@ -138,7 +134,6 @@ class PaymentExternalSystemAdapterImpl(
     override fun name() = properties.accountName
 
     data class Result(val status: Boolean, val message: String?)
-
 }
 
-public fun now() = System.currentTimeMillis()
+fun now() = System.currentTimeMillis()

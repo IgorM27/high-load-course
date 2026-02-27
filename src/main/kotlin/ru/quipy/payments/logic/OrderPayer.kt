@@ -1,7 +1,6 @@
 package ru.quipy.payments.logic
 
 import kotlinx.coroutines.CoroutineScope
-
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.launch
@@ -39,7 +38,8 @@ class OrderPayer(val dbScope: CoroutineScope) {
         NamedThreadFactory("payment-submission-executor"),
         ThreadPoolExecutor.DiscardOldestPolicy()
     )
-    val dispatcher = paymentExecutor.asCoroutineDispatcher()
+
+    private val dispatcher = paymentExecutor.asCoroutineDispatcher()
     private val scope = CoroutineScope(SupervisorJob() + dispatcher)
 
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
