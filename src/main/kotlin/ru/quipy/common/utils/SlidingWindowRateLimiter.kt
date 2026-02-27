@@ -1,22 +1,16 @@
 package ru.quipy.common.utils
 
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import java.time.Duration
 import java.util.concurrent.ConcurrentLinkedQueue
-import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicInteger
-import java.util.concurrent.atomic.AtomicLong
 
 class SlidingWindowRateLimiter(
     private val rate: Long,
     private val window: Duration,
 ) : RateLimiter {
-    private val rateLimiterScope = CoroutineScope(Executors.newSingleThreadExecutor().asCoroutineDispatcher())
 
     private val currentCount = AtomicInteger(0)
     private val timestamps = ConcurrentLinkedQueue<Long>()
@@ -24,12 +18,13 @@ class SlidingWindowRateLimiter(
     override fun tick(): Boolean {
         removeExpired()
         val now = System.currentTimeMillis()
-        if (currentCount.incrementAndGet() <= rate) {
+        val count = currentCount.incrementAndGet()
+        return if (count <= rate) {
             timestamps.add(now)
-            return true
+            true
         } else {
             currentCount.decrementAndGet()
-            return false
+            false
         }
     }
 
@@ -47,19 +42,11 @@ class SlidingWindowRateLimiter(
 
     suspend fun acquireSuspend(timeoutMillis: Long): Boolean {
         val deadline = System.currentTimeMillis() + timeoutMillis
-
         while (System.currentTimeMillis() < deadline) {
-            removeExpired()
-            if (currentCount.get() < rate) {
-                val now = System.currentTimeMillis()
-                if (currentCount.incrementAndGet() <= rate) {
-                    timestamps.add(now)
-                    return true
-                } else {
-                    currentCount.decrementAndGet()
-                }
-            }
-            delay(10)
+            if (tick()) return true
+            val remaining = deadline - System.currentTimeMillis()
+            if (remaining <= 0) break
+            delay(minOf(10L, remaining))
         }
         return false
     }

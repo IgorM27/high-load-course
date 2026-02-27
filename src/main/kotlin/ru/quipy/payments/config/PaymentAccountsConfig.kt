@@ -3,9 +3,17 @@ package ru.quipy.payments.config
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import org.springframework.beans.factory.annotation.Value
 import org.springframework.context.annotation.Bean
 import org.springframework.context.annotation.Configuration
+import ru.quipy.common.utils.NamedThreadFactory
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import ru.quipy.payments.logic.*
@@ -14,6 +22,10 @@ import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.util.*
+import java.util.concurrent.Executors
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
 
 
 @Configuration
@@ -21,6 +33,19 @@ class PaymentAccountsConfig {
     companion object {
         private val javaClient = HttpClient.newBuilder().build()
         private val mapper = ObjectMapper().registerKotlinModule().registerModules(JavaTimeModule())
+
+        private val dbExecutor =
+            ThreadPoolExecutor(
+                32,
+                32,
+                60L,
+                TimeUnit.SECONDS,
+                LinkedBlockingQueue(25_000),
+                NamedThreadFactory("payment-db-executor"),
+                ThreadPoolExecutor.DiscardOldestPolicy()
+            )
+
+        private val dbScope = CoroutineScope(SupervisorJob() + Dispatchers.IO + dbExecutor.asCoroutineDispatcher())
     }
 
     @Value("\${payment.hostPort}")
@@ -34,6 +59,9 @@ class PaymentAccountsConfig {
 
     @Value("#{'\${payment.accounts}'.split(',')}")
     lateinit var allowedAccounts: List<String>
+
+    @Bean
+    fun dbScope() = dbScope
 
     @Bean
     fun accountAdapters(paymentService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>): List<PaymentExternalSystemAdapter> {
@@ -57,7 +85,8 @@ class PaymentAccountsConfig {
                     it,
                     paymentService,
                     paymentProviderHostPort,
-                    token
+                    token,
+                    dbScope
                 )
             }
     }
