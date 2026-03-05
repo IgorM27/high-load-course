@@ -21,9 +21,13 @@ class PaymentSystemImpl(
         val logger = LoggerFactory.getLogger(PaymentSystemImpl::class.java)
     }
 
-    override suspend  fun submitPaymentRequest(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
+    override fun submitPaymentRequest(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         for (account in paymentAccounts) {
             account.performPaymentAsync(paymentId, amount, paymentStartedAt, deadline)
         }
+    }
+
+    override fun getMaxRateLimit(): Int {
+        return paymentAccounts.filter { it.isEnabled() }.sumOf { it.maxRateLimit() }
     }
 }
