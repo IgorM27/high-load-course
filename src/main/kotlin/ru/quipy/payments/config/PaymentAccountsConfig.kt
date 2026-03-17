@@ -11,14 +11,17 @@ import kotlinx.coroutines.asCoroutineDispatcher
 import org.springframework.beans.factory.annotation.Value
 import org.springframework.context.annotation.Bean
 import org.springframework.context.annotation.Configuration
+import org.springframework.http.client.reactive.ReactorClientHttpConnector
+import org.springframework.web.reactive.function.client.WebClient
+import reactor.netty.http.client.HttpClient
 import ru.quipy.common.utils.NamedThreadFactory
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import ru.quipy.payments.logic.*
 import java.net.URI
-import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
+import java.time.Duration
 import java.util.*
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.ThreadPoolExecutor
@@ -27,14 +30,11 @@ import java.util.concurrent.TimeUnit
 @Configuration
 class PaymentAccountsConfig {
     companion object {
-        private val javaClient = HttpClient.newBuilder().build()
+        private val javaClient = java.net.http.HttpClient.newBuilder().build()
         private val mapper = ObjectMapper().registerKotlinModule().registerModules(JavaTimeModule())
 
         private val dbExecutor = ThreadPoolExecutor(
-            32,
-            32,
-            60L,
-            TimeUnit.SECONDS,
+            32, 32, 60L, TimeUnit.SECONDS,
             LinkedBlockingQueue(25_000),
             NamedThreadFactory("payment-db-executor"),
             ThreadPoolExecutor.DiscardOldestPolicy()
@@ -59,9 +59,19 @@ class PaymentAccountsConfig {
     fun dbScope() = dbScope
 
     @Bean
+    fun paymentWebClient(): WebClient {
+        val httpClient = HttpClient.create()
+            .responseTimeout(Duration.ofMillis(1500))
+        return WebClient.builder()
+            .clientConnector(ReactorClientHttpConnector(httpClient))
+            .build()
+    }
+
+    @Bean
     fun accountAdapters(
         paymentService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
-        paymentCircuitBreaker: CircuitBreaker
+        paymentCircuitBreaker: CircuitBreaker,
+        paymentWebClient: WebClient
     ): List<PaymentExternalSystemAdapter> {
         val request = HttpRequest.newBuilder()
             .uri(URI("http://${paymentProviderHostPort}/external/accounts?serviceName=$serviceName&token=$token"))
@@ -85,7 +95,8 @@ class PaymentAccountsConfig {
                     paymentProviderHostPort,
                     token,
                     dbScope,
-                    paymentCircuitBreaker
+                    paymentCircuitBreaker,
+                    paymentWebClient
                 )
             }
     }

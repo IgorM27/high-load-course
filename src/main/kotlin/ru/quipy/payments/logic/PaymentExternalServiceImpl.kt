@@ -3,22 +3,19 @@ package ru.quipy.payments.logic
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import io.github.resilience4j.circuitbreaker.CircuitBreaker
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
+import kotlinx.coroutines.*
+import kotlinx.coroutines.reactor.awaitSingle
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import org.slf4j.LoggerFactory
-import ru.quipy.common.utils.CallerBlockingRejectedExecutionHandler
-import ru.quipy.common.utils.OngoingWindow
+import org.springframework.http.MediaType
+import org.springframework.web.reactive.function.client.WebClient
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
-import java.net.URI
-import java.net.http.HttpClient
-import java.net.http.HttpRequest
-import java.net.http.HttpResponse
 import java.time.Duration
 import java.util.*
-import java.util.concurrent.*
+import java.util.concurrent.TimeUnit
 
 class PaymentExternalSystemAdapterImpl(
     private val properties: PaymentAccountProperties,
@@ -26,32 +23,23 @@ class PaymentExternalSystemAdapterImpl(
     private val paymentProviderHostPort: String,
     private val token: String,
     private val dbScope: CoroutineScope,
-    private val circuitBreaker: CircuitBreaker
+    private val circuitBreaker: CircuitBreaker,
+    private val webClient: WebClient
 ) : PaymentExternalSystemAdapter {
 
     companion object {
         val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
         val mapper = ObjectMapper().registerKotlinModule()
+        const val MAX_HEDGE_ATTEMPTS = 2
+        const val HEDGE_DELAY_MS = 160L
+        const val REQUEST_TIMEOUT_MS = 400L
     }
 
     private val serviceName = properties.serviceName
     private val accountName = properties.accountName
 
     private val rateLimiter = SlidingWindowRateLimiter(properties.rateLimitPerSec.toLong(), Duration.ofSeconds(1))
-    private val ongoingWindow = OngoingWindow(properties.parallelRequests, false)
-    private val scheduler = Executors.newScheduledThreadPool(100)
-
-    private val httpExecutor = ThreadPoolExecutor(
-        maxOf(100, properties.parallelRequests / 10),
-        maxOf(100, properties.parallelRequests / 10),
-        60L, TimeUnit.SECONDS,
-        LinkedBlockingQueue(properties.parallelRequests * 2),
-        Executors.defaultThreadFactory(),
-        CallerBlockingRejectedExecutionHandler(Duration.ofSeconds(5))
-    )
-
-    private val client: HttpClient = HttpClient.newBuilder()
-        .executor(httpExecutor).version(HttpClient.Version.HTTP_2).build()
+    private val semaphore = Semaphore(properties.parallelRequests)
 
     private fun logProcessingAsync(paymentId: UUID, success: Boolean, txId: UUID, reason: String?) {
         val time = now()
@@ -74,6 +62,12 @@ class PaymentExternalSystemAdapterImpl(
 
         logger.info("[$accountName] Submit: $paymentId, txId: $transactionId")
 
+        dbScope.launch {
+            executeWithProtection(paymentId, amount, deadline, transactionId)
+        }
+    }
+
+    private suspend fun executeWithProtection(paymentId: UUID, amount: Int, deadline: Long, transactionId: UUID) {
         if (!circuitBreaker.tryAcquirePermission()) {
             logger.warn("[$accountName] Circuit breaker open, rejecting $paymentId")
             logProcessingAsync(paymentId, false, transactionId, "Circuit breaker open")
@@ -85,59 +79,64 @@ class PaymentExternalSystemAdapterImpl(
             return
         }
 
-        if (!ongoingWindow.acquire(deadline - now(), TimeUnit.MILLISECONDS)) {
-            logger.warn("[$accountName] Semaphore timeout for $paymentId")
-            logProcessingAsync(paymentId, false, transactionId, "Semaphore timeout")
-            return
-        }
-
         val cbStart = now()
-        val futures = mutableListOf(sendRequest(transactionId, paymentId, amount))
+        try {
+            val response = semaphore.withPermit {
+                hedgedRequest(transactionId, paymentId, amount)
+            }
 
-        for (i in 1..2) {
-            scheduler.schedule({
-                if (futures.none { it.isDone }) futures.add(sendRequest(transactionId, paymentId, amount))
-            }, 160L * i, TimeUnit.MILLISECONDS)
+            val elapsed = now() - cbStart
+            val body = response.body
+            if (body != null && body.result) {
+                circuitBreaker.onSuccess(elapsed, TimeUnit.MILLISECONDS)
+            } else {
+                circuitBreaker.onError(elapsed, TimeUnit.MILLISECONDS, RuntimeException(body?.message ?: "Rejected"))
+            }
+
+            logger.warn("[$accountName] Result for txId: $transactionId, payment: $paymentId, ok: ${body?.result}")
+            logProcessingAsync(paymentId, body?.result == true, transactionId, body?.message)
+        } catch (e: Exception) {
+            logger.error("[$accountName] Failed txId: $transactionId, payment: $paymentId", e)
+            circuitBreaker.onError(now() - cbStart, TimeUnit.MILLISECONDS, e)
+            logProcessingAsync(paymentId, false, transactionId, e.message)
+        }
+    }
+
+    private suspend fun hedgedRequest(txId: UUID, paymentId: UUID, amount: Int) = coroutineScope {
+        val result = CompletableDeferred<org.springframework.http.ResponseEntity<ExternalSysResponse?>>()
+
+        val jobs = mutableListOf<Job>()
+        for (attempt in 0..MAX_HEDGE_ATTEMPTS) {
+            val job = launch {
+                if (attempt > 0) delay(HEDGE_DELAY_MS * attempt)
+                if (result.isCompleted) return@launch
+                try {
+                    val response = withTimeout(REQUEST_TIMEOUT_MS) { sendRequest(txId, paymentId, amount) }
+                    result.complete(response)
+                } catch (e: Exception) {
+                    if (attempt == MAX_HEDGE_ATTEMPTS.toInt() && !result.isCompleted) {
+                        result.completeExceptionally(e)
+                    }
+                }
+            }
+            jobs.add(job)
         }
 
-        CompletableFuture.anyOf(*futures.toTypedArray())
-            .thenApply { it as HttpResponse<String> }
-            .thenAccept { response ->
-                val elapsed = now() - cbStart
-                val body = try {
-                    mapper.readValue(response.body(), ExternalSysResponse::class.java)
-                } catch (e: Exception) {
-                    logger.error("[$accountName] Parse error for txId: $transactionId, payment: $paymentId", e)
-                    circuitBreaker.onError(elapsed, TimeUnit.MILLISECONDS, e)
-                    ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
-                }
-
-                if (body.result) circuitBreaker.onSuccess(elapsed, TimeUnit.MILLISECONDS)
-                else circuitBreaker.onError(elapsed, TimeUnit.MILLISECONDS, RuntimeException(body.message ?: "Rejected"))
-
-                logger.warn("[$accountName] Result for txId: $transactionId, payment: $paymentId, ok: ${body.result}")
-                logProcessingAsync(paymentId, body.result, transactionId, body.message)
-                ongoingWindow.release()
-            }
-            .exceptionally { ex ->
-                val rootCause = ex.cause ?: ex
-                logger.error("[$accountName] Failed txId: $transactionId, payment: $paymentId", rootCause)
-                circuitBreaker.onError(now() - cbStart, TimeUnit.MILLISECONDS, rootCause)
-                logProcessingAsync(paymentId, false, transactionId, rootCause.message)
-                ongoingWindow.release()
-                null
-            }
+        try {
+            result.await()
+        } finally {
+            jobs.forEach { it.cancel() }
+        }
     }
 
-    private fun sendRequest(txId: UUID, paymentId: UUID, amount: Int): CompletableFuture<HttpResponse<String>> {
-        val request = HttpRequest.newBuilder()
-            .uri(URI("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$txId&paymentId=$paymentId&amount=$amount"))
-            .timeout(Duration.ofMillis(1500))
+    private suspend fun sendRequest(txId: UUID, paymentId: UUID, amount: Int) =
+        webClient.post()
+            .uri("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$txId&paymentId=$paymentId&amount=$amount")
             .header("x-idempotency-key", txId.toString())
-            .POST(HttpRequest.BodyPublishers.noBody())
-            .build()
-        return client.sendAsync(request, HttpResponse.BodyHandlers.ofString())
-    }
+            .accept(MediaType.APPLICATION_JSON)
+            .retrieve()
+            .toEntity(ExternalSysResponse::class.java)
+            .awaitSingle()
 
     override fun price() = properties.price
     override fun isEnabled() = properties.enabled
