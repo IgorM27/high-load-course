@@ -26,4 +26,8 @@ class PaymentSystemImpl(
             account.performPaymentAsync(paymentId, amount, paymentStartedAt, deadline)
         }
     }
+
+    override fun getMaxRateLimit(): Int {
+        return paymentAccounts.filter { it.isEnabled() }.sumOf { it.maxRateLimit() }
+    }
 }
